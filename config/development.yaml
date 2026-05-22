@@ -1,0 +1,304 @@
+# =============================================================================
+# Dawu Agent - Development Environment Configuration
+# =============================================================================
+# 7-level config priority (low to high):
+# User > Project > Local > Managed > Policy > Flag > CLI
+# Environment variables override all file-based configs.
+
+# ---------------------------------------------------------------------------
+# LLM Configuration
+# ---------------------------------------------------------------------------
+llm:
+  # Default model profile (uses MODEL_API_KEY, MODEL_BASE_URL from .env)
+  default:
+    api_key: "${MODEL_API_KEY}"
+    base_url: "${MODEL_BASE_URL}"
+    name: "${MODEL_NAME}"
+    api_type: "${MODEL_API_TYPE}"
+    temperature: 0.7
+    max_tokens: 4096
+
+  # Fallback model (uses FALLBACK_* variables from .env)
+  fallback:
+    api_key: "${FALLBACK_MODEL_API_KEY}"
+    base_url: "${FALLBACK_MODEL_BASE_URL}"
+    name: "${FALLBACK_MODEL_NAME}"
+    api_type: "${FALLBACK_MODEL_API_TYPE}"
+
+  # Named profiles for scenario-based routing
+  profiles:
+    fast:
+      api_key: "${FAST__MODEL_API_KEY}"
+      base_url: "${FAST__MODEL_BASE_URL}"
+      name: "${FAST__MODEL_NAME}"
+      api_type: "${FAST__MODEL_API_TYPE}"
+    power:
+      api_key: "${POWER__MODEL_API_KEY}"
+      base_url: "${POWER__MODEL_BASE_URL}"
+      name: "${POWER__MODEL_NAME}"
+      api_type: "${POWER__MODEL_API_TYPE}"
+    vision:
+      api_key: "${VISION__MODEL_API_KEY}"
+      base_url: "${VISION__MODEL_BASE_URL}"
+      name: "${VISION__MODEL_NAME}"
+      api_type: "${VISION__MODEL_API_TYPE}"
+    local:
+      api_key: "${LOCAL__MODEL_API_KEY}"
+      base_url: "${LOCAL__MODEL_BASE_URL}"
+      name: "${LOCAL__MODEL_NAME}"
+      api_type: "${LOCAL__MODEL_API_TYPE}"
+
+  # Legacy fields (backward compatibility)
+  provider: "${MODEL_API_TYPE}"
+  model: "${MODEL_NAME}"
+  fallback_provider: "${FALLBACK_MODEL_API_TYPE}"
+  fallback_model: "${FALLBACK_MODEL_NAME}"
+
+  # Generation parameters
+  temperature: 0.7
+  max_tokens: 4096
+  top_p: 1.0
+
+  # Request configuration
+  timeout_seconds: 120
+  max_retries: 3
+  retry_backoff_base: 2.0
+
+  # Prompt caching (Anthropic-specific optimization)
+  prompt_caching: true
+  cache_minimum_tokens: 1024
+
+# ---------------------------------------------------------------------------
+# Agent Configuration
+# ---------------------------------------------------------------------------
+agent:
+  name: "dawu-data-analyst"
+  description: "Enterprise data analysis and report generation agent"
+  version: "0.1.0"
+
+  # Conversation limits
+  max_turns: 50
+  max_tokens_per_session: 100000
+
+  # System prompt
+  system_prompt_path: "config/agents/data_analyst.md"
+
+  # Streaming configuration
+  streaming: true
+  stream_buffer_size: 10
+
+  # Scenario-based model routing map
+  scenario_models:
+    default: "default"
+    fast: "fast"
+    complex: "power"
+    vision: "vision"
+    local: "local"
+
+  # Feature flags
+  features:
+    multi_agent: true
+    vector_memory: true
+    sandbox: true
+    audit_log: true
+    auto_compact: true
+
+# ---------------------------------------------------------------------------
+# Tools Configuration
+# ---------------------------------------------------------------------------
+tools:
+  # Tool registry settings
+  auto_discover: true
+  builtin_enabled:
+    - file_read
+    - file_write
+    - data_query
+    - data_visualize
+    - report_generate
+    - web_search
+    - calculator
+
+  # Per-tool timeout (seconds)
+  default_timeout: 30
+  timeouts:
+    data_query: 120
+    data_visualize: 60
+    web_search: 45
+
+  # MCP servers
+  mcp_servers:
+    - name: filesystem
+      transport: stdio
+      command: "./mcp_servers/filesystem"
+      enabled: true
+    - name: sqlite
+      transport: stdio
+      command: "./mcp_servers/sqlite"
+      enabled: true
+
+  # Concurrency limits
+  max_concurrent_tools: 5
+
+# ---------------------------------------------------------------------------
+# Permissions & Security
+# ---------------------------------------------------------------------------
+permissions:
+  # Default permission mode: allow | deny | ask
+  default_mode: ask
+
+  # Rule layers (cumulative, deny overrides allow)
+  rules:
+    # Layer 1: Hardcoded denies (cannot be overridden)
+    hardcoded:
+      - pattern: "rm -rf /"
+        action: deny
+      - pattern: "sudo"
+        action: deny
+      - pattern: "chmod 777"
+        action: deny
+
+    # Layer 2: Settings rules
+    settings:
+      - pattern: "file_write"
+        target: "*.py"
+        action: ask
+      - pattern: "file_write"
+        target: "config/*"
+        action: deny
+      - pattern: "data_query"
+        target: "*"
+        action: allow
+
+    # Layer 3: Hook rules (loaded from config/hooks/)
+    hooks_enabled: true
+
+# ---------------------------------------------------------------------------
+# Sandbox Configuration
+# ---------------------------------------------------------------------------
+sandbox:
+  enabled: true
+  isolation_level: path  # none | path | docker (use 'path' for no Docker)
+  allowed_paths:
+    - "./workspace"
+    - "./data"
+    - "./uploads"
+  denied_patterns:
+    - "*.pem"
+    - "*.key"
+    - ".env"
+  docker_image: "dawu-sandbox:latest"
+  resource_limits:
+    cpu: "1.0"
+    memory: "512m"
+    timeout: 300
+
+# ---------------------------------------------------------------------------
+# Memory & Context
+# ---------------------------------------------------------------------------
+memory:
+  enabled: true
+
+  # Short-term memory (session context)
+  session:
+    max_messages: 100
+    truncation_threshold: 0.8
+
+  # Long-term memory (vector database)
+  vector:
+    backend: chromadb
+    collection_name: "dawu_memories"
+    embedding_model: "text-embedding-3-small"
+    similarity_threshold: 0.75
+    max_results: 5
+
+  # Compression pipeline
+  compression:
+    enabled: true
+    levels:
+      - snip        # Truncate oldest messages
+      - microcompact # Summarize message groups
+      - collapse    # Compress tool outputs
+      - autocompact # Full context rebuild
+    trigger_threshold: 0.9
+
+# ---------------------------------------------------------------------------
+# Logging & Observability
+# ---------------------------------------------------------------------------
+logging:
+  level: DEBUG  # DEBUG | INFO | WARNING | ERROR
+  format: json  # json | text
+
+  outputs:
+    - type: stdout
+      level: DEBUG
+    - type: file
+      path: "./logs/dawu-agent.log"
+      level: INFO
+      rotation: "1 day"
+      retention: "30 days"
+
+  # Structured logging fields
+  fields:
+    - timestamp
+    - level
+    - logger
+    - trace_id
+    - span_id
+    - message
+    - context
+
+  # OpenTelemetry
+  opentelemetry:
+    enabled: true
+    exporter: otlp
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+    service_name: "${OTEL_SERVICE_NAME}"
+    service_version: "${OTEL_SERVICE_VERSION}"
+
+  # Prometheus metrics
+  prometheus:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# Multi-Agent Configuration
+# ---------------------------------------------------------------------------
+multi_agent:
+  enabled: true
+
+  # Coordinator agent settings
+  coordinator:
+    model: claude-3-5-sonnet-20241022
+    max_sub_agents: 5
+    task_timeout: 300
+
+  # Sub-agent roles
+  roles:
+    - name: data_engineer
+      description: "Extract, transform, and load data"
+      system_prompt: "config/agents/roles/data_engineer.md"
+      tools:
+        - data_query
+        - file_read
+        - file_write
+    - name: analyst
+      description: "Perform statistical analysis and insights"
+      system_prompt: "config/agents/roles/analyst.md"
+      tools:
+        - data_query
+        - calculator
+        - data_visualize
+    - name: report_writer
+      description: "Generate structured reports"
+      system_prompt: "config/agents/roles/report_writer.md"
+      tools:
+        - report_generate
+        - file_write
+        - data_visualize
+
+  # Communication protocol
+  communication:
+    mode: hierarchical  # hierarchical | swarm | debate
+    message_format: structured
+    context_sharing: summary  # full | summary | none

@@ -1,0 +1,57 @@
+# =============================================================================
+# Dawu Agent - Production Environment Configuration
+# =============================================================================
+# Overrides development.yaml with production-specific values.
+# Only specify differences; all other values inherit from development.yaml.
+
+llm:
+  temperature: 0.3  # Lower temperature for more deterministic outputs
+  max_tokens: 8192
+  timeout_seconds: 60
+  max_retries: 5
+
+agent:
+  max_turns: 100
+  max_tokens_per_session: 200000
+  streaming: true
+
+permissions:
+  default_mode: deny  # Stricter default in production
+  sandbox:
+    enabled: true
+    isolation_level: docker
+    resource_limits:
+      cpu: "2.0"
+      memory: "1g"
+      timeout: 600
+
+logging:
+  level: INFO
+  outputs:
+    - type: stdout
+      level: INFO
+    - type: file
+      path: "/var/log/dawu/agent.log"
+      level: WARNING
+      rotation: "1 day"
+      retention: "90 days"
+
+  opentelemetry:
+    enabled: true
+    exporter: otlp
+
+  prometheus:
+    enabled: true
+    port: 9090
+
+memory:
+  vector:
+    backend: chromadb
+    # In production, use external ChromaDB server
+    host: "${CHROMA_HOST}"
+    port: "${CHROMA_PORT}"
+
+multi_agent:
+  coordinator:
+    max_sub_agents: 10
+    task_timeout: 600
