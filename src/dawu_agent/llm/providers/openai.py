@@ -173,6 +173,11 @@ class OpenAIClient(ILLMClient):
         current_tool_calls: dict[str, dict[str, Any]] = {}
 
         async for chunk in stream:
+            if not chunk.choices:
+                # Some streaming chunks (e.g. final usage-only chunks from
+                # third-party OpenAI-compatible APIs) carry no choices.
+                continue
+
             delta = chunk.choices[0].delta
 
             if delta.content:

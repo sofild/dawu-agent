@@ -25,12 +25,22 @@ class ToolRegistry:
         self._max_result_chars = max_result_chars
         self._recently_used: list[str] = []
         self._usage_count: dict[str, int] = {}
+        # Per-tool trigger keywords (used to force-include a tool when the user
+        # prompt contains any of its declared triggers, regardless of how LLM
+        # would otherwise bias the selection).
+        self._triggers: dict[str, set[str]] = {}
 
     def register(self, tool: Tool, core: bool = False) -> None:
         """Register a tool."""
         self._tools[tool.name] = tool
         if core:
             self._core_tools.add(tool.name)
+
+    def register_triggers(self, tool_name: str, triggers: list[str]) -> None:
+        """Register a set of trigger keywords for context-aware tool selection."""
+        if not triggers:
+            return
+        self._triggers.setdefault(tool_name, set()).update(t.strip() for t in triggers if t.strip())
 
     def unregister(self, name: str) -> None:
         """Unregister a tool."""
@@ -65,6 +75,13 @@ class ToolRegistry:
             for name, tool in self._tools.items():
                 desc_lower = tool.description.lower()
                 if any(keyword in hint_lower for keyword in desc_lower.split()[:10]):
+                    selected.add(name)
+
+            # Trigger-based force-include (used by Skill tools). If the user
+            # prompt contains any trigger word registered for a tool, that
+            # tool is always made available to the LLM, bypassing heuristics.
+            for name, triggers in self._triggers.items():
+                if any(t and t in context_hint for t in triggers):
                     selected.add(name)
 
         # Sort by usage frequency (LRU-like)

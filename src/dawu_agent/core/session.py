@@ -19,11 +19,23 @@ class SessionEventLog:
     - Supports replay to reconstruct AgentState
     """
 
-    def __init__(self, session_id: str | None = None, log_dir: str = "sessions") -> None:
+    def __init__(
+        self,
+        session_id: str | None = None,
+        log_dir: str = "sessions",
+        detail_log_dir: str = "logs/running",
+    ) -> None:
         self.session_id = session_id or str(uuid.uuid4())
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / f"{self.session_id}.jsonl"
+
+        # Secondary detailed log under logs/running/ for human grep; one file
+        # per session so every conversation has its own time-ordered JSONL.
+        self.detail_log_dir = Path(detail_log_dir)
+        self.detail_log_dir.mkdir(parents=True, exist_ok=True)
+        self.detail_log_file = self.detail_log_dir / f"{self.session_id}.jsonl"
+
         self._events: list[dict[str, Any]] = []
 
     def append(self, event: AgentEvent) -> None:
@@ -32,6 +44,11 @@ class SessionEventLog:
 
         # Write to disk first (WAL semantics)
         with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
+            f.flush()
+
+        # Mirror the same event into the per-session detailed log
+        with open(self.detail_log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
             f.flush()
 

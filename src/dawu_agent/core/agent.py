@@ -179,6 +179,17 @@ class Agent:
         for tool in core_tools:
             self._tool_registry.register(tool, core=True)
 
+        # Auto-discover SKILL.md-based skills from ./skills and register each
+        # as a single tool. Trigger keywords are stored on the registry so
+        # that `get_for_llm(context_hint=...)` will force-include a skill
+        # tool when the user prompt contains any of its trigger words.
+        try:
+            from dawu_agent.tools.skill_loader import SkillLoader
+            loaded = SkillLoader(skills_dir="skills").register_all(self._tool_registry)
+            self.telemetry.logger.info("skills.loaded", count=loaded)
+        except Exception as e:
+            self.telemetry.logger.error("skills.load_failed", error=str(e))
+
     async def _connect_mcp_servers(self) -> None:
         """Connect to configured MCP servers."""
         for server_config in self.settings.tools.mcp_servers:
@@ -239,286 +250,293 @@ class Agent:
             yield ErrorEvent(error_type="already_running", action="abort")
             return
 
-        # Initialize new session
-        self._state.reset_for_new_session()
-        yield StateChangeEvent(old="idle", new="running")
-        self._session_log.append(StateChangeEvent(old="idle", new="running"))
+        # Ensure state is reset to IDLE if the generator is closed early
+        # (e.g., consumer raised on an ErrorEvent). Otherwise consecutive
+        # turns would be rejected with `already_running`.
+        try:
+            # Initialize new session
+            self._state.reset_for_new_session()
+            yield StateChangeEvent(old="idle", new="running")
+            self._session_log.append(StateChangeEvent(old="idle", new="running"))
 
-        # Record user message
-        user_msg = UserMessageEvent(content=user_input)
-        self._session_log.append(user_msg)
-        yield user_msg
+            # Record user message
+            user_msg = UserMessageEvent(content=user_input)
+            self._session_log.append(user_msg)
+            yield user_msg
 
-        # Inject relevant memories (Phase 5)
-        memory_context = ""
-        if self._memory_manager:
-            memories = await self._memory_manager.get_relevant_memories(
-                messages=[Message(role="user", content=user_input)],
-                current_task=user_input,
-            )
-            memory_context = self._memory_manager.format_for_context(memories)
-
-        # Build system prompt with memory context and current time
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo("Asia/Shanghai")
-        current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-        weekday = datetime.now(tz).strftime("%A")
-
-        system_content = (
-            f"You are Dawu Agent, an enterprise data analysis assistant. "
-            f"The current date and time is {current_time} ({weekday}). "
-            f"When the user mentions time-related words (today, yesterday, this week, etc.) "
-            f"and you need to search, always pass the appropriate time filter parameter."
-        )
-        if memory_context:
-            system_content += f"\n\n{memory_context}"
-
-        self._state.messages = [
-            Message(role="system", content=system_content),
-            Message(role="user", content=user_input),
-        ]
-
-        # =====================================================================
-        # NEVER-EXITING MAIN LOOP
-        # =====================================================================
-        while True:
-            # Check pause
-            if self._state.pause_requested:
-                self._state.status = AgentState.PAUSED
-                yield StateChangeEvent(old="running", new="paused")
-                await self._wait_for_resume()
-                self._state.status = AgentState.RUNNING
-                yield StateChangeEvent(old="paused", new="running")
-
-            # Check expiration
-            expire_reason = self._state.check_expired()
-            if expire_reason:
-                self._state.status = AgentState.EXPIRED
-                yield StateChangeEvent(old="running", new="expired", reason=expire_reason)
-                self._session_log.append(
-                    StateChangeEvent(old="running", new="expired", reason=expire_reason)
+            # Inject relevant memories (Phase 5)
+            memory_context = ""
+            if self._memory_manager:
+                memories = await self._memory_manager.get_relevant_memories(
+                    messages=[Message(role="user", content=user_input)],
+                    current_task=user_input,
                 )
-                break
+                memory_context = self._memory_manager.format_for_context(memories)
 
-            # Turn start
-            self._state.turn_number += 1
-            turn_start = time.monotonic()
-            turn_start_event = TurnStartEvent(turn=self._state.turn_number)
-            self._session_log.append(turn_start_event)
-            yield turn_start_event
+            # Build system prompt with memory context and current time
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
 
-            try:
-                # ---------------------------------------------------------------
-                # CONTINUE SITE 1: Proactive Compaction (Phase 5)
-                # ---------------------------------------------------------------
-                token_count = self._llm_client.count_tokens(self._state.messages)
-                max_tokens = self.settings.agent.max_tokens_per_session
-                if self._compression_pipeline and self._compression_pipeline.should_compress(
-                    self._state.messages, max_tokens
-                ):
-                    yield CompactionEvent(detail=f"Token count {token_count} exceeds threshold")
-                    result = self._compression_pipeline.compact(
-                        self._state.messages, max_tokens, reason="proactive"
-                    )
-                    self._state.messages = result.messages
-                    if self._audit_logger:
-                        self._audit_logger.log_compression(
-                            level=result.level_used,
-                            input_tokens=token_count,
-                            output_tokens=self._llm_client.count_tokens(result.messages),
-                            duration_ms=0,
-                        )
+            tz = ZoneInfo("Asia/Shanghai")
+            current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+            weekday = datetime.now(tz).strftime("%A")
 
-                # ---------------------------------------------------------------
-                # Call LLM with streaming
-                # ---------------------------------------------------------------
-                tools = self._tool_registry.get_for_llm(context_hint=user_input)
-                accumulated_text = []
-                tool_calls_buffer: list[ToolCall] = []
+            system_content = (
+                f"You are Dawu Agent, an enterprise data analysis assistant. "
+                f"The current date and time is {current_time} ({weekday}). "
+                f"When the user mentions time-related words (today, yesterday, this week, etc.) "
+                f"and you need to search, always pass the appropriate time filter parameter."
+            )
+            if memory_context:
+                system_content += f"\n\n{memory_context}"
 
-                async for chunk in self._llm_client.chat_stream(
-                    messages=self._state.messages,
-                    tools=tools if tools else None,
-                ):
-                    if chunk.content:
-                        accumulated_text.append(chunk.content)
-                        text_event = AssistantTextEvent(content=chunk.content)
-                        self._session_log.append(text_event)
-                        yield text_event
+            self._state.messages = [
+                Message(role="system", content=system_content),
+                Message(role="user", content=user_input),
+            ]
 
-                    if chunk.tool_call:
-                        tool_calls_buffer.append(chunk.tool_call)
-                        tool_event = ToolUseEvent(
-                            tool_name=chunk.tool_call.name,
-                            tool_input=chunk.tool_call.arguments,
-                            tool_use_id=chunk.tool_call.id,
-                        )
-                        self._session_log.append(tool_event)
-                        yield tool_event
+            # =================================================================
+            # NEVER-EXITING MAIN LOOP
+            # =================================================================
+            while True:
+                # Check pause
+                if self._state.pause_requested:
+                    self._state.status = AgentState.PAUSED
+                    yield StateChangeEvent(old="running", new="paused")
+                    await self._wait_for_resume()
+                    self._state.status = AgentState.RUNNING
+                    yield StateChangeEvent(old="paused", new="running")
 
-                    if chunk.finish_reason:
-                        final_text = "".join(accumulated_text)
-                        if final_text:
-                            final_event = AssistantTextEvent(content=final_text, is_final=True)
-                            self._session_log.append(final_event)
-
-                # ---------------------------------------------------------------
-                # Handle tool calls (CONTINUE SITE 7)
-                # ---------------------------------------------------------------
-                if tool_calls_buffer:
-                    for tc in tool_calls_buffer:
-                        # Phase 6: Permission check
-                        perm_decision = self._permission_manager.check_permission(
-                            tc.name, tc.arguments
-                        )
-                        if self._audit_logger:
-                            self._audit_logger.log_permission_check(
-                                tool_name=tc.name,
-                                tool_input=tc.arguments,
-                                decision=perm_decision.action.value,
-                                reason=perm_decision.reason,
-                                decision_chain=perm_decision.decision_chain,
-                            )
-
-                        if perm_decision.action.value == "deny":
-                            result = ToolResult.error(
-                                f"Permission denied: {perm_decision.reason}"
-                            )
-                        else:
-                            # Phase 6: Hook pre-execution
-                            modified_input = await self._hook_system.execute_pre(
-                                tc.name, tc.arguments, context={"user_input": user_input}
-                            )
-                            result = await self._tool_registry.execute(tc.name, modified_input)
-                            # Phase 6: Hook post-execution
-                            result = await self._hook_system.execute_post(
-                                tc.name, modified_input, result
-                            )
-
-                        result_event = ToolResultEvent(
-                            tool_use_id=tc.id,
-                            content=str(result.data) if result.data else result.error or "",
-                            is_error=not result.success,
-                        )
-                        self._session_log.append(result_event)
-                        yield result_event
-
-                        # Append tool result to messages (pseudo-immutable)
-                        self._state.messages = [
-                            *self._state.messages,
-                            Message(
-                                role="tool",
-                                content=str(result.data) if result.data else result.error or "",
-                                tool_call_id=tc.id,
-                            ),
-                        ]
-
-                    # Reset consecutive errors on successful tool execution
-                    self._state.consecutive_errors = 0
-                    self._emit_turn_end(turn_start)
-                    continue  # Back to while True
-
-                # ---------------------------------------------------------------
-                # No tool calls - final response
-                # ---------------------------------------------------------------
-                final_text = "".join(accumulated_text)
-                if final_text:
-                    self._state.messages = [
-                        *self._state.messages,
-                        Message(role="assistant", content=final_text),
-                    ]
-
-                self._state.status = AgentState.IDLE
-                yield StateChangeEvent(old="running", new="idle", reason="complete")
-                yield FinalResponseEvent(text=final_text)
-                self._emit_turn_end(turn_start)
-                break
-
-            # ================================================================
-            # ERROR RECOVERY: 6 Continue Sites
-            # ================================================================
-            except Exception as e:
-                error_str = str(e).lower()
-
-                # CONTINUE SITE 2: Prompt Too Long
-                if "prompt too long" in error_str or "413" in error_str:
-                    if self._state.has_attempted_reactive_compact:
-                        # Already tried - do aggressive snip
-                        self._state.messages = self._emergency_snip(self._state.messages)
-                        self._state.has_attempted_reactive_compact = False
-                    else:
-                        if self._compression_pipeline:
-                            result = self._compression_pipeline.compact(
-                                self._state.messages, max_tokens, reason="reactive"
-                            )
-                            self._state.messages = result.messages
-                        else:
-                            self._state.messages = self._reactive_compact(self._state.messages)
-                        self._state.has_attempted_reactive_compact = True
-
-                    self._state.consecutive_errors += 1
-                    yield ErrorEvent(
-                        error_type="prompt_too_long",
-                        turn=self._state.turn_number,
-                        action="compact",
-                    )
-                    continue
-
-                # CONTINUE SITE 3: Max Output Tokens
-                if "max_tokens" in error_str or "length" in error_str:
-                    self._state.messages = [
-                        *self._state.messages,
-                        Message(role="user", content="Please continue from where you left off."),
-                    ]
-                    self._state.consecutive_errors += 1
-                    yield ErrorEvent(
-                        error_type="max_output_tokens",
-                        turn=self._state.turn_number,
-                        action="continue_prompt",
-                    )
-                    continue
-
-                # CONTINUE SITE 4: Model Unavailable / Fallback
-                if any(code in error_str for code in ["503", "429", "rate limit"]):
-                    if self.settings.llm.fallback_provider:
-                        self._llm_client = LLMClientFactory.create(
-                            self.settings.llm,
-                            provider_override=self.settings.llm.fallback_provider,
-                        )
-                        yield ErrorEvent(
-                            error_type="model_unavailable",
-                            turn=self._state.turn_number,
-                            action="fallback",
-                            detail=f"Switched to {self.settings.llm.fallback_provider}",
-                        )
-                    else:
-                        await asyncio.sleep(min(2 ** self._state.consecutive_errors, 60))
-
-                    self._state.consecutive_errors += 1
-                    continue
-
-                # Generic retriable error
-                if self._state.check_max_errors():
-                    self._state.status = AgentState.ERROR
-                    self._state.last_error_type = type(e).__name__
-                    yield StateChangeEvent(
-                        old="running",
-                        new="error",
-                        reason=f"max_consecutive_errors: {e}",
+                # Check expiration
+                expire_reason = self._state.check_expired()
+                if expire_reason:
+                    self._state.status = AgentState.EXPIRED
+                    yield StateChangeEvent(old="running", new="expired", reason=expire_reason)
+                    self._session_log.append(
+                        StateChangeEvent(old="running", new="expired", reason=expire_reason)
                     )
                     break
 
-                self._state.consecutive_errors += 1
-                yield ErrorEvent(
-                    error_type="retriable",
-                    turn=self._state.turn_number,
-                    action="retry",
-                    detail=str(e),
-                )
-                await asyncio.sleep(min(2 ** self._state.consecutive_errors, 30))
-                continue
+                # Turn start
+                self._state.turn_number += 1
+                turn_start = time.monotonic()
+                turn_start_event = TurnStartEvent(turn=self._state.turn_number)
+                self._session_log.append(turn_start_event)
+                yield turn_start_event
+
+                try:
+                    # ---------------------------------------------------------------
+                    # CONTINUE SITE 1: Proactive Compaction (Phase 5)
+                    # ---------------------------------------------------------------
+                    token_count = self._llm_client.count_tokens(self._state.messages)
+                    max_tokens = self.settings.agent.max_tokens_per_session
+                    if self._compression_pipeline and self._compression_pipeline.should_compress(
+                        self._state.messages, max_tokens
+                    ):
+                        yield CompactionEvent(detail=f"Token count {token_count} exceeds threshold")
+                        result = self._compression_pipeline.compact(
+                            self._state.messages, max_tokens, reason="proactive"
+                        )
+                        self._state.messages = result.messages
+                        if self._audit_logger:
+                            self._audit_logger.log_compression(
+                                level=result.level_used,
+                                input_tokens=token_count,
+                                output_tokens=self._llm_client.count_tokens(result.messages),
+                                duration_ms=0,
+                            )
+
+                    # ---------------------------------------------------------------
+                    # Call LLM with streaming
+                    # ---------------------------------------------------------------
+                    tools = self._tool_registry.get_for_llm(context_hint=user_input)
+                    accumulated_text = []
+                    tool_calls_buffer: list[ToolCall] = []
+
+                    async for chunk in self._llm_client.chat_stream(
+                        messages=self._state.messages,
+                        tools=tools if tools else None,
+                    ):
+                        if chunk.content:
+                            accumulated_text.append(chunk.content)
+                            text_event = AssistantTextEvent(content=chunk.content)
+                            self._session_log.append(text_event)
+                            yield text_event
+
+                        if chunk.tool_call:
+                            tool_calls_buffer.append(chunk.tool_call)
+                            tool_event = ToolUseEvent(
+                                tool_name=chunk.tool_call.name,
+                                tool_input=chunk.tool_call.arguments,
+                                tool_use_id=chunk.tool_call.id,
+                            )
+                            self._session_log.append(tool_event)
+                            yield tool_event
+
+                        if chunk.finish_reason:
+                            final_text = "".join(accumulated_text)
+                            if final_text:
+                                final_event = AssistantTextEvent(content=final_text, is_final=True)
+                                self._session_log.append(final_event)
+
+                    # ---------------------------------------------------------------
+                    # Handle tool calls (CONTINUE SITE 7)
+                    # ---------------------------------------------------------------
+                    if tool_calls_buffer:
+                        for tc in tool_calls_buffer:
+                            # Phase 6: Permission check
+                            perm_decision = self._permission_manager.check_permission(
+                                tc.name, tc.arguments
+                            )
+                            if self._audit_logger:
+                                self._audit_logger.log_permission_check(
+                                    tool_name=tc.name,
+                                    tool_input=tc.arguments,
+                                    decision=perm_decision.action.value,
+                                    reason=perm_decision.reason,
+                                    decision_chain=perm_decision.decision_chain,
+                                )
+
+                            if perm_decision.action.value == "deny":
+                                result = ToolResult.error(
+                                    f"Permission denied: {perm_decision.reason}"
+                                )
+                            else:
+                                # Phase 6: Hook pre-execution
+                                modified_input = await self._hook_system.execute_pre(
+                                    tc.name, tc.arguments, context={"user_input": user_input}
+                                )
+                                result = await self._tool_registry.execute(tc.name, modified_input)
+                                # Phase 6: Hook post-execution
+                                result = await self._hook_system.execute_post(
+                                    tc.name, modified_input, result
+                                )
+
+                            result_event = ToolResultEvent(
+                                tool_use_id=tc.id,
+                                content=str(result.data) if result.data else result.error or "",
+                                is_error=not result.success,
+                            )
+                            self._session_log.append(result_event)
+                            yield result_event
+
+                            # Append tool result to messages (pseudo-immutable)
+                            self._state.messages = [
+                                *self._state.messages,
+                                Message(
+                                    role="tool",
+                                    content=str(result.data) if result.data else result.error or "",
+                                    tool_call_id=tc.id,
+                                ),
+                            ]
+
+                        # Reset consecutive errors on successful tool execution
+                        self._state.consecutive_errors = 0
+                        self._emit_turn_end(turn_start)
+                        continue  # Back to while True
+
+                    # ---------------------------------------------------------------
+                    # No tool calls - final response
+                    # ---------------------------------------------------------------
+                    final_text = "".join(accumulated_text)
+                    if final_text:
+                        self._state.messages = [
+                            *self._state.messages,
+                            Message(role="assistant", content=final_text),
+                        ]
+
+                    self._state.status = AgentState.IDLE
+                    yield StateChangeEvent(old="running", new="idle", reason="complete")
+                    yield FinalResponseEvent(text=final_text)
+                    self._emit_turn_end(turn_start)
+                    break
+
+                # ================================================================
+                # ERROR RECOVERY: 6 Continue Sites
+                # ================================================================
+                except Exception as e:
+                    error_str = str(e).lower()
+
+                    # CONTINUE SITE 2: Prompt Too Long
+                    if "prompt too long" in error_str or "413" in error_str:
+                        if self._state.has_attempted_reactive_compact:
+                            # Already tried - do aggressive snip
+                            self._state.messages = self._emergency_snip(self._state.messages)
+                            self._state.has_attempted_reactive_compact = False
+                        else:
+                            if self._compression_pipeline:
+                                result = self._compression_pipeline.compact(
+                                    self._state.messages, max_tokens, reason="reactive"
+                                )
+                                self._state.messages = result.messages
+                            else:
+                                self._state.messages = self._reactive_compact(self._state.messages)
+                            self._state.has_attempted_reactive_compact = True
+
+                        self._state.consecutive_errors += 1
+                        yield ErrorEvent(
+                            error_type="prompt_too_long",
+                            turn=self._state.turn_number,
+                            action="compact",
+                        )
+                        continue
+
+                    # CONTINUE SITE 3: Max Output Tokens
+                    if "max_tokens" in error_str or "length" in error_str:
+                        self._state.messages = [
+                            *self._state.messages,
+                            Message(role="user", content="Please continue from where you left off."),
+                        ]
+                        self._state.consecutive_errors += 1
+                        yield ErrorEvent(
+                            error_type="max_output_tokens",
+                            turn=self._state.turn_number,
+                            action="continue_prompt",
+                        )
+                        continue
+
+                    # CONTINUE SITE 4: Model Unavailable / Fallback
+                    if any(code in error_str for code in ["503", "429", "rate limit"]):
+                        if self.settings.llm.fallback_provider:
+                            self._llm_client = LLMClientFactory.create(
+                                self.settings.llm,
+                                provider_override=self.settings.llm.fallback_provider,
+                            )
+                            yield ErrorEvent(
+                                error_type="model_unavailable",
+                                turn=self._state.turn_number,
+                                action="fallback",
+                                detail=f"Switched to {self.settings.llm.fallback_provider}",
+                            )
+                        else:
+                            await asyncio.sleep(min(2 ** self._state.consecutive_errors, 60))
+
+                        self._state.consecutive_errors += 1
+                        continue
+
+                    # Generic retriable error
+                    if self._state.check_max_errors():
+                        self._state.status = AgentState.ERROR
+                        self._state.last_error_type = type(e).__name__
+                        yield StateChangeEvent(
+                            old="running",
+                            new="error",
+                            reason=f"max_consecutive_errors: {e}",
+                        )
+                        break
+
+                    self._state.consecutive_errors += 1
+                    yield ErrorEvent(
+                        error_type="retriable",
+                        turn=self._state.turn_number,
+                        action="retry",
+                        detail=str(e),
+                    )
+                    await asyncio.sleep(min(2 ** self._state.consecutive_errors, 30))
+                    continue
+        finally:
+            if self._state.status == AgentState.RUNNING:
+                self._state.status = AgentState.IDLE
 
     async def run_multi_agent(self, task: str) -> str:
         """Execute task using multi-agent coordination."""
