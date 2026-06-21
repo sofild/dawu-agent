@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import os
+
+# Disable LiteLLM's remote model-cost-map fetch before any transitive
+# import (DSPy -> LiteLLM) reads it. The remote endpoint at
+# raw.githubusercontent.com frequently times out from restricted
+# networks, producing a noisy WARNING on every agent startup even
+# though LiteLLM falls back to a local backup just fine.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 import asyncio
 from pathlib import Path
 
@@ -111,6 +120,8 @@ async def _interactive_loop(settings, telemetry) -> None:
     )
     console.print("\n[bold green]Agent ready. Type your message or 'exit' to quit.[/bold green]\n")
 
+    first_interaction = True
+
     while True:
         try:
             user_input = console.input("[bold blue]You:[/bold blue] ")
@@ -118,10 +129,18 @@ async def _interactive_loop(settings, telemetry) -> None:
                 console.print("[yellow]Shutting down...[/yellow]")
                 await agent.shutdown()
                 break
+            if not user_input.strip():
+                console.print("[yellow]请输入内容（直接回车不会触发 Agent）[/yellow]\n")
+                continue
 
             with telemetry.tracer.start_as_current_span("agent.turn") as span:
                 span.set_attribute("user.input_length", len(user_input))
-                final_text = await _stream_to_console(agent, user_input, telemetry)
+                final_text = await _stream_to_console(
+                    agent, user_input, telemetry,
+                    continue_session=not first_interaction,
+                )
+
+            first_interaction = False
 
             # Final aggregated response, kept visually distinct from the
             # intermediate streaming text already printed.
@@ -136,7 +155,9 @@ async def _interactive_loop(settings, telemetry) -> None:
             console.print(f"[red]Error: {e}[/red]")
 
 
-async def _stream_to_console(agent, user_input: str, telemetry) -> str:
+async def _stream_to_console(
+    agent, user_input: str, telemetry, *, continue_session: bool = False,
+) -> str:
     """Consume `agent.run_stream()` and print key events as they happen.
 
     Returns the final aggregated response text (joined from all is_final=True
@@ -160,7 +181,9 @@ async def _stream_to_console(agent, user_input: str, telemetry) -> str:
 
     with spinner_ctx:
         try:
-            async for event in agent.run_stream(user_input):
+            async for event in agent.run_stream(
+                user_input, continue_session=continue_session,
+            ):
                 if isinstance(event, StateChangeEvent):
                     # Quiet — just show transitions to running/idle/error.
                     if event.new in ("running", "idle", "error", "expired", "paused"):
@@ -173,43 +196,71 @@ async def _stream_to_console(agent, user_input: str, telemetry) -> str:
                     if event.is_final:
                         final_parts.append(event.content)
                     else:
-                        # Stop the spinner for the first streamed chunk so
-                        # text appears in-line. Re-render status updates are
-                        # not safe with Live, so we keep status as-is.
-                        console.print(event.content, end="", highlight=False)
-                        printed_first_assistant_text = True
+                        # Do NOT echo raw LLM chunks here — they arrive one
+                        # fragment per line (`报告。\n`, `---\n`, …) and
+                        # produce the vertical scattered noise the user
+                        # complained about. Instead just bump the spinner
+                        # status once to "正在生成回复..." and let the final
+                        # consolidated answer render after the run ends.
+                        if not printed_first_assistant_text:
+                            spinner_ctx.update("[bold cyan]正在生成回复...[/bold cyan]")
+                            printed_first_assistant_text = True
 
                 elif isinstance(event, ToolUseEvent):
                     arg_preview = str(event.tool_input)
                     if len(arg_preview) > 120:
                         arg_preview = arg_preview[:120] + "…"
-                    console.print(
-                        f"\n[yellow]🔧 调用工具:[/yellow] "
-                        f"[bold]{event.tool_name}[/bold] [dim]({arg_preview})[/dim]"
-                    )
+                    spinner_ctx.stop()
+                    try:
+                        console.print(
+                            f"[yellow]🔧 调用工具:[/yellow] "
+                            f"[bold]{event.tool_name}[/bold] [dim]({arg_preview})[/dim]"
+                        )
+                    finally:
+                        spinner_ctx.start()
 
                 elif isinstance(event, ToolResultEvent):
                     content = event.content or ""
-                    if event.is_error:
-                        console.print(
-                            f"[red]❌ 工具失败:[/red] {content[:200]}"
-                        )
-                    else:
+                    spinner_ctx.stop()
+                    try:
+                        # markup=False so LLM-produced content (which can
+                        # contain Rich look-alikes like `**` or `[/dim]`)
+                        # is not interpreted as console markup.
                         preview = content[:200]
                         if len(content) > 200:
                             preview += "…"
-                        console.print(f"[dim]📦 结果(前 200 字): {preview}[/dim]")
+                        if event.is_error:
+                            console.print(
+                                f"[red]❌ 工具失败:[/red] ", end=""
+                            )
+                            console.print(preview, markup=False, highlight=False)
+                        else:
+                            console.print(
+                                f"[dim]📦 结果(前 200 字):[/dim] ", end=""
+                            )
+                            console.print(preview, markup=False, highlight=False)
+                    finally:
+                        spinner_ctx.start()
 
                 elif isinstance(event, CompactionEvent):
-                    console.print(f"[dim]🗜 上下文压缩: {event.detail}[/dim]")
+                    spinner_ctx.stop()
+                    try:
+                        console.print(f"[dim]🗜 上下文压缩: {event.detail}[/dim]")
+                    finally:
+                        spinner_ctx.start()
 
                 elif isinstance(event, ErrorEvent):
                     detail = event.detail or ""
-                    console.print(
-                        f"[red]⚠ {event.error_type}[/red] "
-                        f"[dim](turn={event.turn}, action={event.action})[/dim] "
-                        f"{detail[:200]}"
-                    )
+                    spinner_ctx.stop()
+                    try:
+                        console.print(
+                            f"[red]⚠ {event.error_type}[/red] "
+                            f"[dim](turn={event.turn}, action={event.action})[/dim] ",
+                            end="",
+                        )
+                        console.print(detail[:200], markup=False, highlight=False)
+                    finally:
+                        spinner_ctx.start()
                     telemetry.logger.error(
                         "agent.event_error",
                         error_type=event.error_type,
@@ -227,8 +278,9 @@ async def _stream_to_console(agent, user_input: str, telemetry) -> str:
             telemetry.logger.error("agent.stream_error", error=str(e))
             raise
 
-    if printed_first_assistant_text:
-        # Ensure we are on a new line before caller prints "Agent: …"
+    if printed_first_assistant_text or final_parts:
+        # The final reply is rendered with its own "Agent: …" prefix by the
+        # caller, so just leave a blank line for visual separation.
         console.print("")
 
     return "".join(final_parts)
@@ -257,6 +309,30 @@ def health() -> None:
     """Check agent health status."""
     console.print("[green]Health check: OK[/green]")
     # TODO: Implement actual health checks
+
+
+@app.command()
+def optimize(
+    output_path: str = typer.Option(
+        "dspy_optimized.json", "--output", "-o",
+        help="Output path for optimized module",
+    ),
+) -> None:
+    """Optimize the agent's DSPy modules using collected training data."""
+    _print_banner()
+    console.print("[bold cyan]Running DSPy optimization...[/bold cyan]")
+
+    try:
+        from dawu_agent.dspy_integration.optimizer import (
+            optimize_agent_reasoner,
+            save_optimized_module,
+        )
+        compiled = optimize_agent_reasoner()
+        save_optimized_module(compiled, output_path)
+        console.print(f"[green]Optimized module saved to {output_path}[/green]")
+    except Exception as e:
+        console.print(f"[red]Optimization failed: {e}[/red]")
+        raise typer.Exit(code=1) from None
 
 
 if __name__ == "__main__":

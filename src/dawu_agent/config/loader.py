@@ -158,6 +158,18 @@ class AgentConfig(BaseSettings):
     system_prompt_path: str = "config/agents/default.md"
     streaming: bool = True
 
+    # Per-turn guard rails. These prevent the agent from looping forever when
+    # the LLM repeatedly calls tools (or the same tool with bad params) and
+    # from getting stuck on a single LLM call.
+    max_tool_calls_per_turn: int = 8
+    llm_call_timeout_seconds: int = 180
+
+    # Toggle the fire-and-forget DSPy "observation" hook. When enabled, every
+    # turn fires an extra background LLM call to log what DSPy *would* have
+    # decided. Useful for offline A/B and training data, but adds 30-40s/turn
+    # and can race with the main event loop. Default OFF.
+    dspy_observe: bool = False
+
     # Scenario-based model routing
     scenario_models: dict[str, str] = Field(default_factory=lambda: {
         "default": "default",

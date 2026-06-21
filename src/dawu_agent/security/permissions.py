@@ -198,7 +198,7 @@ class PermissionManager:
                 )
 
         # Default: ask for write/execute, allow for read
-        if tool_name in ("file_write", "file_edit", "bash"):
+        if tool_name in ("file_write", "file_edit", "bash", "python_execute"):
             return PermissionDecision(
                 action=Action.ASK,
                 reason="default mode: write/execute requires confirmation",

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from dawu_agent.tools.base import ConcurrencyMode, Tool, ToolCategory, ToolResult
+from dawu_agent.tools.builtin.file_tools import _resolve_output_path
 
 
 class DataQueryTool(Tool):
@@ -28,7 +29,8 @@ class DataQueryTool(Tool):
             "  - source (string, required): Path to data file or 'memory' for in-memory data\n"
             "  - query_type (string, required): 'pandas' or 'sql'\n"
             "  - operation (string, required): Python code (pandas) or SQL query\n"
-            "  - output_path (string, optional): Save result to this path\n"
+            "  - output_path (string, optional): Save result to this path. "
+            "If only a filename is given, it will be saved under workspace/.\n"
             "Returns: Query results as formatted string or summary"
         )
 
@@ -122,7 +124,7 @@ class DataQueryTool(Tool):
 
             # Save if output_path specified
             if arguments.get("output_path"):
-                out_path = Path(arguments["output_path"])
+                out_path = _resolve_output_path(Path(arguments["output_path"]), "workspace")
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 if isinstance(result, pd.DataFrame):
                     if out_path.suffix == ".csv":
@@ -161,7 +163,8 @@ class DataVisualizeTool(Tool):
             "  - chart_type (string, required): 'line', 'bar', 'scatter', 'histogram', 'heatmap'\n"
             "  - x_column (string, required): Column for x-axis\n"
             "  - y_column (string, optional): Column for y-axis\n"
-            "  - output_path (string, required): Path to save the chart image\n"
+            "  - output_path (string, required): Path to save the chart image. "
+            "If only a filename is given, it will be saved under workspace/.\n"
             "Returns: Path to generated visualization"
         )
 
@@ -244,12 +247,12 @@ class DataVisualizeTool(Tool):
             ax.set_title(f"{chart_type.title()} Chart: {x_col}")
             plt.tight_layout()
 
-            out_path = Path(output_path)
+            out_path = _resolve_output_path(Path(output_path), "workspace")
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, dpi=150, bbox_inches="tight")
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
-            return ToolResult.ok(f"Chart saved to: {output_path}")
+            return ToolResult.ok(f"Chart saved to: {out_path}")
 
         except Exception as e:
             return ToolResult.error(f"Visualization failed: {e}")
@@ -271,7 +274,8 @@ class ReportGenerateTool(Tool):
             "  - title (string, required): Report title\n"
             "  - sections (array, required): List of section objects with 'heading' and 'content'\n"
             "  - format (string, required): 'markdown' or 'html'\n"
-            "  - output_path (string, required): Path to save the report\n"
+            "  - output_path (string, required): Path to save the report. "
+            "If only a filename is given, it will be saved under reports/.\n"
             "Returns: Path to generated report"
         )
 
@@ -331,11 +335,11 @@ class ReportGenerateTool(Tool):
             else:
                 return ToolResult.error(f"Unknown format: {fmt}")
 
-            out_path = Path(output_path)
+            out_path = _resolve_output_path(Path(output_path), "reports")
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(content, encoding="utf-8")
 
-            return ToolResult.ok(f"Report saved to: {output_path}")
+            return ToolResult.ok(f"Report saved to: {out_path}")
 
         except Exception as e:
             return ToolResult.error(f"Report generation failed: {e}")

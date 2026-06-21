@@ -34,7 +34,7 @@ class AgentRunState:
     turn_number: int = 0
     max_turns: int = 50
     session_started_at: float = 0.0
-    session_timeout_seconds: float = 600.0
+    session_timeout_seconds: float = 1800.0
 
     # Recovery flags
     has_attempted_reactive_compact: bool = False

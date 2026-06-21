@@ -18,6 +18,16 @@ class ToolRegistry:
     - Result truncation for large outputs
     """
 
+    # Web search tool names that should be hidden from the LLM when a
+    # skill's trigger keywords match the user query. Keeping this as a
+    # class-level constant makes the policy easy to audit and extend
+    # (e.g. add `duckduckgo_search` later).
+    _WEB_SEARCH_TOOLS: frozenset[str] = frozenset({
+        "bing_search",
+        "baidu_search",
+        "tavily_search",
+    })
+
     def __init__(self, max_concurrent: int = 5, max_result_chars: int = 8000) -> None:
         self._tools: dict[str, Tool] = {}
         self._core_tools: set[str] = set()
@@ -29,6 +39,12 @@ class ToolRegistry:
         # prompt contains any of its declared triggers, regardless of how LLM
         # would otherwise bias the selection).
         self._triggers: dict[str, set[str]] = {}
+        # Side-channel: when `get_for_llm` suppresses web search tools
+        # because a skill's triggers matched, stash the details here so the
+        # agent can read & log it via its own telemetry. Keyed by nothing
+        # (overwritten on each call — only the most recent call is of
+        # interest for the current turn).
+        self._last_web_search_suppression: dict | None = None
 
     def register(self, tool: Tool, core: bool = False) -> None:
         """Register a tool."""
@@ -55,14 +71,26 @@ class ToolRegistry:
         """List all registered tools."""
         return list(self._tools.values())
 
-    def get_for_llm(self, context_hint: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def get_for_llm(
+        self,
+        context_hint: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
         """Get tool definitions for LLM context.
 
         Strategy:
         1. Always include core tools
         2. Include recently used tools
         3. If context_hint provided, include relevant tools by keyword matching
-        4. Respect limit
+        4. **Skill-priority hard rule** (see `_match_skill_triggers`): if any
+           registered skill's trigger keywords hit the user prompt, the web
+           search tools (`bing_search` / `baidu_search` / `tavily_search`)
+           are *removed* from the visible tool list. The rationale: if we
+           have a skill with an accurate data source for this domain, the
+           LLM must not fall back to public web search (which produces
+           noisier / less reliable answers for closed-domain questions
+           like "某高校的某指标").
+        5. Respect limit
         """
         selected = set(self._core_tools)
 
@@ -70,6 +98,7 @@ class ToolRegistry:
         selected.update(self._recently_used[-5:])
 
         # Context-based selection
+        skill_triggers_hit: set[str] = set()
         if context_hint:
             hint_lower = context_hint.lower()
             for name, tool in self._tools.items():
@@ -83,6 +112,34 @@ class ToolRegistry:
             for name, triggers in self._triggers.items():
                 if any(t and t in context_hint for t in triggers):
                     selected.add(name)
+                    skill_triggers_hit.add(name)
+
+        # ------------------------------------------------------------------
+        # Skill-priority hard rule: if ANY skill's triggers matched the user
+        # prompt, suppress web search tools. This is deterministic — the LLM
+        # literally does not see `bing_search` / `baidu_search` / `tavily_search`
+        # as available tools, so it cannot fall back to network search even
+        # when the skill returns empty data.
+        #
+        # When no skill triggered (e.g. user asks about weather / current
+        # events), web search stays available.
+        #
+        # Side effect: stash the suppression event on `self` so the agent
+        # can pick it up via `consume_last_web_search_suppression()` and
+        # log via its own telemetry (the registry stays telemetry-agnostic).
+        # ------------------------------------------------------------------
+        if skill_triggers_hit:
+            suppressed = selected & self._WEB_SEARCH_TOOLS
+            if suppressed:
+                selected -= self._WEB_SEARCH_TOOLS
+                self._last_web_search_suppression = {
+                    "matched_skills": sorted(skill_triggers_hit),
+                    "suppressed_tools": sorted(suppressed),
+                }
+            else:
+                self._last_web_search_suppression = None
+        else:
+            self._last_web_search_suppression = None
 
         # Sort by usage frequency (LRU-like)
         sorted_tools = sorted(
@@ -95,6 +152,32 @@ class ToolRegistry:
         limited = sorted_tools[:limit]
 
         return [self._tools[name].to_llm_definition() for name in limited if name in self._tools]
+
+    def skill_triggers_match(self, context_hint: str) -> set[str]:
+        """Return the set of skill tool names whose triggers match `context_hint`.
+
+        Public helper so other layers (e.g. agent's system-prompt builder)
+        can ask the same question and add belt-and-suspenders instructions.
+        Returns an empty set if no skill matched.
+        """
+        if not context_hint:
+            return set()
+        return {
+            name
+            for name, triggers in self._triggers.items()
+            if any(t and t in context_hint for t in triggers)
+        }
+
+    def consume_last_web_search_suppression(self) -> dict | None:
+        """Return and clear the most recent web-search suppression event.
+
+        The agent calls this after `get_for_llm` to log via its own
+        telemetry. Returns None if no suppression happened on the last call.
+        This is a "consume" pattern so the same event isn't logged twice.
+        """
+        ev = self._last_web_search_suppression
+        self._last_web_search_suppression = None
+        return ev
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Execute a single tool."""

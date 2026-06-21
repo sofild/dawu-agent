@@ -8,6 +8,18 @@ from typing import Any
 from dawu_agent.tools.base import ConcurrencyMode, Tool, ToolCategory, ToolResult
 
 
+def _resolve_output_path(path: Path, default_dir: str) -> Path:
+    """Place bare filenames into a default subdirectory of the project root.
+
+    Absolute paths and explicit relative paths are kept as-is.
+    """
+    if path.is_absolute():
+        return path
+    if len(path.parts) == 1:
+        return Path(default_dir) / path
+    return path
+
+
 class FileReadTool(Tool):
     """Read file contents."""
 
@@ -75,7 +87,8 @@ class FileWriteTool(Tool):
             "Use this to save analysis results, generated reports, or processed data. "
             "Be careful not to overwrite important files.\n"
             "Parameters:\n"
-            "  - path (string, required): Path to write to\n"
+            "  - path (string, required): Path to write to. If only a filename is given, "
+            "it will be saved under workspace/.\n"
             "  - content (string, required): Content to write\n"
             "Returns: Success confirmation with file path"
         )
@@ -107,10 +120,10 @@ class FileWriteTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         try:
-            path = Path(arguments["path"])
+            path = _resolve_output_path(Path(arguments["path"]), "workspace")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(arguments["content"], encoding="utf-8")
-            return ToolResult.ok(f"File written successfully: {path.absolute()}")
+            return ToolResult.ok(f"File written successfully: {path}")
         except Exception as e:
             return ToolResult.error(f"Failed to write file: {e}")
 

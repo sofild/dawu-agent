@@ -221,7 +221,7 @@ class CollapseStrategy(CompressionStrategy):
 
 
 class AutocompactStrategy(CompressionStrategy):
-    """Level 4: LLM-based semantic summarization."""
+    """Level 4: LLM-based semantic summarization (DSPy-enhanced)."""
 
     def __init__(
         self,
@@ -230,6 +230,13 @@ class AutocompactStrategy(CompressionStrategy):
     ) -> None:
         self.llm_client = llm_client
         self.token_counter = token_counter
+        self._compression_module: Any = None
+        # Try to load DSPy CompressionModule
+        try:
+            from dawu_agent.dspy_integration.modules import CompressionModule
+            self._compression_module = CompressionModule()
+        except Exception:
+            self._compression_module = None
 
     def compress(self, request: CompressionRequest) -> CompressionResult | None:
         messages = request.messages
@@ -272,15 +279,29 @@ class AutocompactStrategy(CompressionStrategy):
             f"[{m.role}] {m.content[:500]}" for m in historical
         )
 
-        try:
-            summary_response = self.llm_client.chat_sync(
-                messages=[
-                    Message(role="user", content=compact_prompt + history_text),
-                ]
-            )
-            summary = summary_response.content
-        except Exception:
-            return None
+        summary = ""
+        # Try DSPy CompressionModule first
+        if self._compression_module is not None:
+            try:
+                result = self._compression_module(
+                    conversation_history=history_text,
+                    current_task=request.reason or "ongoing analysis",
+                )
+                summary = result.summary
+            except Exception:
+                summary = ""
+
+        # Fallback to raw LLM call if DSPy failed or not available
+        if not summary:
+            try:
+                summary_response = self.llm_client.chat_sync(
+                    messages=[
+                        Message(role="user", content=compact_prompt + history_text),
+                    ]
+                )
+                summary = summary_response.content
+            except Exception:
+                return None
 
         recovery_message = Message(
             role="system",

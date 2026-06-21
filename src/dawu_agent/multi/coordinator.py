@@ -53,9 +53,39 @@ class Coordinator:
         self.llm_client = llm_client
         self.max_sub_agents = max_sub_agents
         self.task_timeout = task_timeout
+        # Try to load DSPy MultiAgentModule
+        self._multi_agent_module: Any = None
+        try:
+            from dawu_agent.dspy_integration.modules import MultiAgentModule
+            self._multi_agent_module = MultiAgentModule()
+        except Exception:
+            self._multi_agent_module = None
 
     async def decompose(self, task: str, context: str = "") -> list[SubTask]:
-        """Decompose a complex task into sub-tasks using LLM."""
+        """Decompose a complex task into sub-tasks using LLM (DSPy-enhanced)."""
+        # Try DSPy MultiAgentModule first
+        if self._multi_agent_module is not None:
+            try:
+                import json
+                result = self._multi_agent_module(
+                    task=f"{task}\n上下文：{context}" if context else task,
+                    available_roles="data_engineer, analyst, report_writer",
+                )
+                data = json.loads(result.subtasks)
+                subtasks = []
+                for item in data.get("subtasks", []):
+                    subtasks.append(SubTask(
+                        id=item["id"],
+                        description=item["description"],
+                        role=item["role"],
+                        dependencies=item.get("dependencies", []),
+                        expected_output=item.get("expected_output", ""),
+                    ))
+                return subtasks[:self.max_sub_agents]
+            except Exception:
+                pass  # Fall through to original LLM path
+
+        # Original LLM-based decomposition
         prompt = f"""请将以下复杂数据分析任务分解为独立的子任务。
 
 任务：{task}
@@ -183,8 +213,8 @@ class Coordinator:
             )
 
     async def synthesize(self, results: list[TaskResult], original_task: str) -> str:
-        """Synthesize sub-agent results into final output."""
-        # Build synthesis prompt
+        """Synthesize sub-agent results into final output (DSPy-enhanced)."""
+        # Build summaries for both paths
         summaries = []
         for r in results:
             status = "成功" if r.success else "失败"
@@ -194,13 +224,26 @@ class Coordinator:
                 f"发现：{'; '.join(r.findings)}\n"
                 f"错误：{'; '.join(r.errors)}\n"
             )
+        summaries_text = "\n".join(summaries)
 
+        # Try DSPy MultiAgentModule.synthesize first
+        if self._multi_agent_module is not None:
+            try:
+                result = self._multi_agent_module.synthesize(
+                    original_task=original_task,
+                    subtask_results=summaries_text,
+                )
+                return result.final_report
+            except Exception:
+                pass  # Fall through to original LLM path
+
+        # Original LLM-based synthesis
         prompt = f"""请综合以下子任务的结果，生成最终的分析报告。
 
 原始任务：{original_task}
 
 子任务结果：
-{chr(10).join(summaries)}
+{summaries_text}
 
 请生成一份结构化的综合报告，包含：
 1. 执行摘要
@@ -215,4 +258,4 @@ class Coordinator:
             )
             return response.content
         except Exception as e:
-            return f"综合报告生成失败：{e}\n\n原始结果：\n{chr(10).join(summaries)}"
+            return f"综合报告生成失败：{e}\n\n原始结果：\n{summaries_text}"

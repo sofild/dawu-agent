@@ -82,3 +82,7 @@ docker-volumes/
 
 # Kubernetes secrets
 *k8s*secret*.yaml
+*__pycache__*
+*.pyc
+
+memory

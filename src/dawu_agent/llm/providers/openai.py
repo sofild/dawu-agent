@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from dawu_agent.llm.base import (
@@ -57,14 +58,28 @@ class OpenAIClient(ILLMClient):
             openai_msg: dict[str, Any] = {"role": msg.role, "content": msg.content}
 
             if msg.role == "assistant" and msg.tool_calls:
+                openai_msg["content"] = msg.content or ""
                 openai_msg["tool_calls"] = []
                 for tc in msg.tool_calls:
+                    # tool_call.arguments MUST be a JSON-encoded string per
+                    # the OpenAI spec. str(dict) produces single-quoted Python
+                    # repr which is rejected by strict third-party
+                    # OpenAI-compatible gateways (e.g. autodl).
+                    try:
+                        arguments_json = (
+                            tc.arguments
+                            if isinstance(tc.arguments, str)
+                            else json.dumps(tc.arguments, ensure_ascii=False)
+                        )
+                    except (TypeError, ValueError):
+                        arguments_json = "{}"
+
                     openai_msg["tool_calls"].append({
                         "id": tc.id,
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": str(tc.arguments),
+                            "arguments": arguments_json,
                         },
                     })
 

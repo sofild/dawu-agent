@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +11,6 @@ from typing import Any
 from dawu_agent.tools.base import Tool
 from dawu_agent.tools.registry import ToolRegistry
 from dawu_agent.tools.skill_tool import SkillTool
-
 
 # Regex for YAML front-matter delimited by '---' on the first line.
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -26,6 +26,10 @@ class SkillDefinition:
     scripts_dir: Path | None = None
     skill_dir: Path | None = None
     tool_name: str = ""
+    # Optional manual override: if set, used as the action whitelist instead
+    # of auto-generating from db_query.py. Allows fine-grained control per
+    # skill via SKILL.md `exposed_actions`.
+    exposed_actions: dict[str, list[str]] | None = None
 
     def to_tool(self) -> Tool:
         assert self.scripts_dir is not None
@@ -34,6 +38,7 @@ class SkillDefinition:
             description=self.description,
             scripts_dir=self.scripts_dir,
             triggers=self.triggers,
+            action_schemas=self.exposed_actions,
         )
 
 
@@ -79,10 +84,8 @@ class SkillLoader:
                 continue
             # Stash triggers for context-aware selection
             if hasattr(registry, "register_triggers"):
-                try:
+                with contextlib.suppress(Exception):
                     registry.register_triggers(tool.name, defn.triggers)
-                except Exception:
-                    pass
             count += 1
         return count
 
@@ -99,7 +102,6 @@ class SkillLoader:
         if m:
             meta = _parse_simple_yaml(m.group(1))
             body = raw[m.end():]
-
         name = str(meta.get("name") or skill_dir.name)
         description = str(
             meta.get("description")
@@ -132,6 +134,20 @@ class SkillLoader:
 
         from dawu_agent.tools.skill_tool import _slugify
 
+        # Manual override: `exposed_actions` in SKILL.md front-matter.
+        # Format (YAML list-of-maps or nested map under `metadata`):
+        #   exposed_actions:
+        #     query_school: [school_name, model_name]
+        #   metadata:
+        #     exposed_actions:
+        #       query_school: [school_name, model_name]
+        # If absent, the SkillTool will auto-generate from db_query.py.
+        # We look in BOTH top-level (legacy) and metadata.* (new style).
+        raw_exposed = meta.get("exposed_actions")
+        if raw_exposed is None and isinstance(meta.get("metadata"), dict):
+            raw_exposed = meta["metadata"].get("exposed_actions")
+        exposed_actions = _parse_exposed_actions(raw_exposed)
+
         return SkillDefinition(
             name=name,
             description=description.strip(),
@@ -139,11 +155,29 @@ class SkillLoader:
             scripts_dir=scripts_dir,
             skill_dir=skill_dir,
             tool_name=_slugify(name),
+            exposed_actions=exposed_actions,
         )
 
 
 def _parse_simple_yaml(block: str) -> dict[str, Any]:
-    """Tiny YAML subset parser: `key: value` per line, and `key: [a, b, c]` lists."""
+    """Parse YAML front-matter. Prefers PyYAML when available, falls back to a
+    tiny subset parser.
+
+    The simple parser only handles flat `key: value` lines, which silently
+    flattens nested keys like `metadata.exposed_actions.query_school` into
+    top-level keys (a bug that hid the `exposed_actions` field from
+    `_parse_exposed_actions`). PyYAML handles nesting correctly.
+    """
+    # Prefer PyYAML — full YAML support including nested maps and inline lists
+    try:
+        import yaml  # type: ignore
+
+        parsed = yaml.safe_load(block)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    # Fallback: simple parser (legacy)
     out: dict[str, Any] = {}
     for line in block.splitlines():
         if not line.strip() or line.strip().startswith("#"):
@@ -158,9 +192,10 @@ def _parse_simple_yaml(block: str) -> dict[str, Any]:
         if value.startswith("[") and value.endswith("]"):
             inner = value[1:-1]
             out[key] = [s.strip().strip('"\'') for s in inner.split(",") if s.strip()]
-        elif value.startswith('"') and value.endswith('"'):
-            out[key] = value[1:-1]
-        elif value.startswith("'") and value.endswith("'"):
+        elif (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        ):
             out[key] = value[1:-1]
         else:
             out[key] = value
@@ -193,3 +228,86 @@ def _extract_zh_keywords(text: str, max_keywords: int = 12) -> list[str]:
         if len(found) >= max_keywords:
             break
     return found
+
+
+def _parse_exposed_actions(raw: Any) -> dict[str, list[str]] | None:
+    """Parse the `exposed_actions` field from SKILL.md front-matter.
+
+    Accepts many shapes (because the simple YAML parser in this file is, well,
+    simple). The skill author can write any of:
+
+    1. List-of-maps (cleanest):
+           exposed_actions:
+             - get_school: [name, dept_code]
+             - list_models: []
+    2. Compact map (works with our simple YAML parser):
+           exposed_actions: {get_school: [name], list_models: []}
+    3. Bare action names (no params; treat each as zero-arg):
+           exposed_actions: [get_school, list_models]
+    4. Comma-separated string:
+           exposed_actions: "get_school, list_models"
+    5. Quoted-JSON-ish string (the simple parser gives us this):
+           exposed_actions: '{get_school: [name], list_models: []}'
+
+    Returns None if the input is empty or unparsable, signaling that the
+    SkillTool should auto-generate from the script.
+    """
+    if raw is None:
+        return None
+    out: dict[str, list[str]] = {}
+
+    def _coerce_params(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            s = value.strip()
+            # Recognize empty list / empty string -> zero-arg
+            if s in ("", "[]", "()", "()", "null", "None"):
+                return []
+            return [v.strip() for v in re.split(r"[,，、\s]+", s) if v.strip()]
+        return []
+
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            out[str(k).strip()] = _coerce_params(v)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    out[str(k).strip()] = _coerce_params(v)
+            elif isinstance(item, str):
+                if ":" in item:
+                    key, _, value = item.partition(":")
+                    out[key.strip()] = _coerce_params(value)
+                else:
+                    # Bare action name: zero-arg whitelist entry
+                    name = item.strip()
+                    if name:
+                        out[name] = []
+            else:
+                continue
+    elif isinstance(raw, str):
+        # Could be a JSON-ish string from the simple YAML parser, e.g.
+        # `"{get_school: [name], list_models: []}"`. Best-effort: try to
+        # detect that shape, otherwise treat as comma-separated names.
+        s = raw.strip()
+        if s.startswith("{") and s.endswith("}"):
+            inner = s[1:-1]
+            # Naive parse: split on commas that are not inside brackets
+            for chunk in re.split(r",(?![^\[\]]*\])", inner):
+                chunk = chunk.strip()
+                if not chunk or ":" not in chunk:
+                    continue
+                key, _, value = chunk.partition(":")
+                out[key.strip()] = _coerce_params(value.strip())
+        else:
+            for name in re.split(r"[,，、\s]+", s):
+                name = name.strip()
+                if name:
+                    out[name] = []
+    else:
+        return None
+
+    return out or None
