@@ -259,3 +259,75 @@ class Coordinator:
             return response.content
         except Exception as e:
             return f"综合报告生成失败：{e}\n\n原始结果：\n{summaries_text}"
+
+
+@dataclass
+class EvaluationResult:
+    """Result of independent evaluation of a sub-agent's output."""
+
+    passed: bool
+    issues: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    suggested_improvements: list[str] = field(default_factory=list)
+
+
+class IndependentEvaluator:
+    """Independent evaluator for adversarial verification of sub-agent results (v4).
+
+    Key principle: the generator should not evaluate its own output.
+    Uses a separate LLM call to verify results are correct and complete.
+    """
+
+    def __init__(self, llm_client: ILLMClient) -> None:
+        self.llm_client = llm_client
+
+    async def evaluate(self, task: str, result: TaskResult) -> EvaluationResult:
+        """Evaluate a sub-agent's result independently."""
+        import json
+
+        findings_text = "; ".join(result.findings) if result.findings else "无"
+        errors_text = "; ".join(result.errors) if result.errors else "无"
+
+        prompt = f"""你是一个独立的评估者，负责对子智能体的输出进行对抗性验证。
+
+原始任务：
+{task}
+
+子智能体结果：
+- 是否成功：{result.success}
+- 摘要：{result.summary}
+- 发现：{findings_text}
+- 错误：{errors_text}
+
+请独立验证以下内容：
+1. 结果是否真正回答了原始任务的要求？
+2. 发现是否有充分的证据支撑？
+3. 是否存在遗漏、错误或不一致之处？
+
+请按以下JSON格式输出：
+{{
+  "passed": true,
+  "issues": ["问题1", "问题2"],
+  "confidence": 0.0,
+  "suggested_improvements": ["改进建议1", "改进建议2"]
+}}
+
+只输出JSON，不要其他解释。"""
+
+        try:
+            response = self.llm_client.chat_sync(
+                messages=[Message(role="user", content=prompt)]
+            )
+            data = json.loads(response.content)
+            return EvaluationResult(
+                passed=bool(data.get("passed", False)),
+                issues=list(data.get("issues", [])),
+                confidence=float(data.get("confidence", 0.0)),
+                suggested_improvements=list(data.get("suggested_improvements", [])),
+            )
+        except Exception:
+            return EvaluationResult(
+                passed=result.success,
+                issues=["评估失败，无法独立验证结果"],
+                confidence=0.0,
+            )

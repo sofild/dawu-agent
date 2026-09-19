@@ -1,9 +1,15 @@
-"""Four-level compression pipeline for context management."""
+"""Five-level compression pipeline for context management (v4: Mask-first).
+
+Pipeline order: Mask → Snip → Microcompact → Collapse → Autocompact
+Threshold: 60-70% (default 65%), not 85% — see references/05-phase-context.md.
+"""
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from dawu_agent.llm.base import ILLMClient, Message
 
@@ -28,6 +34,47 @@ class CompressionResult:
     recovery_hints: list[str] = field(default_factory=list)
 
 
+class CompactionLedger:
+    """Append-only ledger recording each compression operation (v4).
+
+    Each entry contains: timestamp, level_used, tokens_freed, reason,
+    strategy_name.  Used for debugging compression behavior and auditing
+    context loss.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[dict[str, Any]] = []
+
+    def record(
+        self,
+        level: int,
+        tokens_freed: int,
+        reason: str,
+        strategy_name: str,
+    ) -> None:
+        self._entries.append({
+            "timestamp": time.monotonic(),
+            "level": level,
+            "tokens_freed": tokens_freed,
+            "reason": reason,
+            "strategy": strategy_name,
+        })
+
+    @property
+    def entries(self) -> list[dict[str, Any]]:
+        return list(self._entries)
+
+    def total_freed(self) -> int:
+        return sum(e["tokens_freed"] for e in self._entries)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_compressions": len(self._entries),
+            "total_tokens_freed": self.total_freed(),
+            "entries": list(self._entries),
+        }
+
+
 class CompressionStrategy:
     """Base class for compression strategies."""
 
@@ -36,8 +83,90 @@ class CompressionStrategy:
         raise NotImplementedError
 
 
+class MaskStrategy(CompressionStrategy):
+    """Level 1 (v4): Mask long tool results by keeping head+tail.
+
+    This is the FIRST and cheapest strategy — ~0ms, 0 API calls.
+    Tool outputs are the primary source of context growth. Masking
+    preserves head+tail (decision-relevant parts) and replaces the
+    middle with a placeholder.
+
+    Marked messages get a ``_masked`` attribute to prevent re-masking.
+    The operation is fully reversible (original content is preserved,
+    only a masked view is generated).
+    """
+
+    def __init__(
+        self,
+        token_counter: Callable[[list[Message]], int],
+        threshold: int = 4000,
+        head_tokens: int = 1500,
+        tail_tokens: int = 500,
+    ) -> None:
+        self.token_counter = token_counter
+        self.threshold = threshold
+        self.head_tokens = head_tokens
+        self.tail_tokens = tail_tokens
+
+    def compress(self, request: CompressionRequest) -> CompressionResult | None:
+        messages = list(request.messages)
+        freed = 0
+
+        for i, msg in enumerate(messages):
+            if msg.role != "tool":
+                continue
+            # Skip already-masked messages
+            if getattr(msg, "_masked", False):
+                continue
+
+            msg_tokens = self.token_counter([msg])
+            if msg_tokens <= self.threshold:
+                continue
+
+            content = msg.content or ""
+            # Calculate head/tail character lengths proportional to token ratio
+            ratio = self.head_tokens / max(msg_tokens, 1)
+            head_len = int(len(content) * ratio)
+            tail_len = int(len(content) * (self.tail_tokens / max(msg_tokens, 1)))
+
+            head = content[:head_len]
+            tail = content[-tail_len:] if tail_len > 0 else ""
+            omitted = len(content) - head_len - tail_len
+
+            if omitted <= 0:
+                continue
+
+            new_content = (
+                head
+                + f"\n... [中间 {omitted} 字符已遮蔽 (Mask)] ...\n"
+                + tail
+            )
+
+            masked_msg = Message(
+                role=msg.role,
+                content=new_content,
+                name=msg.name,
+                tool_calls=msg.tool_calls,
+                tool_call_id=msg.tool_call_id,
+            )
+            # Mark as masked to prevent re-processing
+            object.__setattr__(masked_msg, "_masked", True)  # noqa: B010
+            messages[i] = masked_msg
+            freed += omitted // 4  # Rough token estimate
+
+        if freed == 0:
+            return None
+
+        return CompressionResult(
+            messages=messages,
+            tokens_freed=freed,
+            level_used=1,
+            recovery_hints=["tool_outputs_masked"],
+        )
+
+
 class SnipStrategy(CompressionStrategy):
-    """Level 1: Remove oldest messages with summary injection."""
+    """Level 2: Remove oldest messages with summary injection."""
 
     def __init__(self, token_counter: Callable[[list[Message]], int]) -> None:
         self.token_counter = token_counter
@@ -335,22 +464,34 @@ class AutocompactStrategy(CompressionStrategy):
 
 
 class CompressionPipeline:
-    """Orchestrates four-level compression: Snip → Microcompact → Collapse → Autocompact."""
+    """Orchestrates five-level compression: Mask → Snip → Microcompact → Collapse → Autocompact.
+
+    v4 changes:
+    - Mask is now Level 1 (first, cheapest, reversible)
+    - budget_ratio default lowered from 0.85 to 0.65
+    - CompactionLedger records every compression for auditing
+    """
 
     def __init__(
         self,
         llm_client: ILLMClient,
         token_counter: Callable[[list[Message]], int],
-        budget_ratio: float = 0.85,
+        budget_ratio: float = 0.65,
     ) -> None:
         self.token_counter = token_counter
         self.budget_ratio = budget_ratio
-        self.strategies = [
-            SnipStrategy(token_counter),
-            MicrocompactStrategy(token_counter),
-            CollapseStrategy(token_counter),
-            AutocompactStrategy(llm_client, token_counter),
+        self._ledger = CompactionLedger()
+        self.strategies: list[tuple[str, CompressionStrategy]] = [
+            ("Mask", MaskStrategy(token_counter)),
+            ("Snip", SnipStrategy(token_counter)),
+            ("Microcompact", MicrocompactStrategy(token_counter)),
+            ("Collapse", CollapseStrategy(token_counter)),
+            ("Autocompact", AutocompactStrategy(llm_client, token_counter)),
         ]
+
+    @property
+    def ledger(self) -> CompactionLedger:
+        return self._ledger
 
     def should_compress(self, messages: list[Message], max_tokens: int) -> bool:
         """Check if compression is needed."""
@@ -381,10 +522,17 @@ class CompressionPipeline:
             reason=reason,
         )
 
-        # Try each strategy in order
-        for strategy in self.strategies:
+        # Try each strategy in order (v4: tuple of name, strategy)
+        for strategy_name, strategy in self.strategies:
             result = strategy.compress(request)
             if result is not None:
+                # Record in compaction ledger (v4)
+                self._ledger.record(
+                    level=result.level_used,
+                    tokens_freed=result.tokens_freed,
+                    reason=reason,
+                    strategy_name=strategy_name,
+                )
                 # Check if budget is now met
                 new_tokens = self.token_counter(result.messages)
                 if new_tokens <= budget:

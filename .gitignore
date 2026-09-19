@@ -4,7 +4,8 @@
 
 # Environment & Secrets
 .env
-.trae/skills
+.trae
+.agents/skills
 .env.*
 !.env.example
 *.pem

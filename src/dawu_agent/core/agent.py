@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 
 def _short_args(arguments: dict[str, Any], max_len: int = 80) -> str:
@@ -104,6 +105,8 @@ def _classify_outcome(content: str) -> dict[str, Any]:
 from dawu_agent.config.loader import Settings
 from dawu_agent.context.compression import CompressionPipeline
 from dawu_agent.context.memory import MemoryManager
+from dawu_agent.core.budget import Budget, BudgetConfig, DegradationLevel
+from dawu_agent.core.errors import ErrorKind, classify_error
 from dawu_agent.core.events import (
     AgentEvent,
     AssistantTextEvent,
@@ -119,6 +122,7 @@ from dawu_agent.core.events import (
 )
 from dawu_agent.core.session import SessionEventLog
 from dawu_agent.core.state import AgentRunState, AgentState
+from dawu_agent.core.verifier import Verifier
 from dawu_agent.llm.base import ILLMClient, Message, ToolCall
 from dawu_agent.llm.factory import LLMClientFactory
 from dawu_agent.multi.coordinator import Coordinator
@@ -135,15 +139,15 @@ from dawu_agent.tools.builtin.data_tools import (
     DataVisualizeTool,
     ReportGenerateTool,
 )
-from dawu_agent.tools.builtin.search_tools import (
-    BaiduSearchTool,
-    BingSearchTool,
-    TavilySearchTool,
-)
 from dawu_agent.tools.builtin.file_tools import (
     FileListTool,
     FileReadTool,
     FileWriteTool,
+)
+from dawu_agent.tools.builtin.search_tools import (
+    BaiduSearchTool,
+    BingSearchTool,
+    TavilySearchTool,
 )
 from dawu_agent.tools.mcp.adapter import MCPAdapter
 from dawu_agent.tools.registry import ToolRegistry
@@ -174,6 +178,10 @@ class Agent:
         # Phase 5: Context management
         self._compression_pipeline: CompressionPipeline | None = None
         self._memory_manager: MemoryManager | None = None
+        # v4: Budget tracking with four-level degradation chain
+        self._budget: Budget | None = None
+        # v4: Verifier for CONTINUE-SITE-8 (deterministic verification)
+        self._verifier: Verifier | None = None
         # Phase 6: Security
         self._permission_manager = PermissionManager(
             default_mode=PermissionMode(settings.permissions.default_mode)
@@ -214,6 +222,19 @@ class Agent:
                 llm_client=self._llm_client,
                 token_counter=self._llm_client.count_tokens,
             )
+
+        # v4: Initialize budget tracker
+        budget_cfg = getattr(self.settings.agent, "budget", None)
+        if budget_cfg and isinstance(budget_cfg, dict):
+            self._budget = Budget(BudgetConfig(**budget_cfg))
+        else:
+            self._budget = Budget(BudgetConfig(
+                max_tokens=self.settings.agent.max_tokens_per_session,
+                max_turns=self.settings.agent.max_turns,
+            ))
+
+        # v4: Initialize verifier with default checks
+        self._verifier = Verifier()
 
         # Initialize memory manager (Phase 5)
         if self.settings.enable_vector_memory:
@@ -500,13 +521,28 @@ class Agent:
                     self._session_log.append(
                         StateChangeEvent(old="running", new="expired", reason=expire_reason)
                     )
-                    # Yield a FinalResponseEvent so the caller knows why the
-                    # session ended instead of silently returning an empty
-                    # string.
                     yield FinalResponseEvent(
                         text=f'会话已结束（{expire_reason}）。您可以输入"继续"让我接着完成。'
                     )
                     break
+
+                # v4: Budget check (alongside max_turns/session_timeout)
+                if self._budget:
+                    self._budget.record_turn()
+                    degradation = self._budget.check()
+                    if degradation == DegradationLevel.ABORT:
+                        abort_reason = self._budget.abort_reason() or "budget exceeded"
+                        self._state.status = AgentState.EXPIRED
+                        yield StateChangeEvent(
+                            old="running", new="expired", reason=f"budget_aborted: {abort_reason}"
+                        )
+                        self._session_log.append(
+                            StateChangeEvent(old="running", new="expired", reason=f"budget: {abort_reason}")
+                        )
+                        yield FinalResponseEvent(
+                            text=f'预算已耗尽（{abort_reason}），会话终止。您可以输入"继续"重试。'
+                        )
+                        break
 
                 # Turn start
                 self._state.turn_number += 1
@@ -789,15 +825,45 @@ class Agent:
                                     f"Permission denied: {perm_decision.reason}"
                                 )
                             else:
-                                # Phase 6: Hook pre-execution
+                                # Phase 6: Hook pre-execution (v4: timeout→DENY)
                                 modified_input = await self._hook_system.execute_pre(
                                     tc.name, tc.arguments, context={"user_input": user_input}
                                 )
-                                result = await self._tool_registry.execute(tc.name, modified_input)
-                                # Phase 6: Hook post-execution
-                                result = await self._hook_system.execute_post(
-                                    tc.name, modified_input, result
-                                )
+                                # v4: Hook returned denial signal
+                                if isinstance(modified_input, dict) and modified_input.get("_hook_denied"):
+                                    result = ToolResult.error(
+                                        f"Hook denied: {modified_input.get('_hook_reason', 'unknown')}"
+                                    )
+                                else:
+                                    result = await self._tool_registry.execute(tc.name, modified_input)
+                                    # Phase 6: Hook post-execution
+                                    result = await self._hook_system.execute_post(
+                                        tc.name, modified_input, result
+                                    )
+
+                                # v4: CONTINUE-SITE-8 — Deterministic verification
+                                if self._verifier and result.success:
+                                    from dawu_agent.core.verifier import DefaultVerifierCheck
+                                    # Ensure default check is registered
+                                    if not self._verifier._checks:
+                                        self._verifier.register_check(DefaultVerifierCheck())
+                                    v_result = self._verifier.verify(tc.name, tc.arguments, result)
+                                    if not v_result.passed:
+                                        # Inject structured failure as sensor context
+                                        sensor_msg = (
+                                            f"[VERIFICATION FAILED] {v_result.failure_detail}"
+                                        )
+                                        if v_result.suggested_fix:
+                                            sensor_msg += f" Suggested fix: {v_result.suggested_fix}"
+                                        result = ToolResult.error(sensor_msg)
+                                        # Check if we should escalate
+                                        if self._verifier.should_escalate(tc.name):
+                                            yield ErrorEvent(
+                                                error_type="verification_escalation",
+                                                turn=self._state.turn_number,
+                                                action="escalate",
+                                                detail=f"Tool {tc.name} failed verification {3} times consecutively",
+                                            )
 
                             result_event = ToolResultEvent(
                                 tool_use_id=tc.id,
@@ -860,28 +926,19 @@ class Agent:
                     break
 
                 # ================================================================
-                # ERROR RECOVERY: 6 Continue Sites
+                # ERROR RECOVERY (v4): ErrorKind-based classification
                 # ================================================================
                 except Exception as e:
-                    error_str = str(e).lower()
+                    classification = classify_error(e)
+                    kind = classification.kind
 
-                    # CONTINUE SITE 1b: Non-retriable client error (4xx).
-                    # Bad-request / param-error / auth-error mean the LLM gateway
-                    # rejected our payload. Retrying with the same payload (or a
-                    # micro-variant) burns tokens and stalls the session. The
-                    # pragmatic fix is to terminate gracefully so the user can
-                    # see the error and try a different approach.
-                    if any(
-                        marker in error_str
-                        for marker in ("param_error", "invalid_request", "400 ", "401 ",
-                                       "403 ", "404 ", "422 ", "400-")
-                    ):
+                    # ── NON_RETRIABLE: terminate session ──
+                    if kind == ErrorKind.NON_RETRIABLE:
                         self._state.status = AgentState.ERROR
                         self._state.last_error_type = type(e).__name__
                         yield StateChangeEvent(
-                            old="running",
-                            new="error",
-                            reason=f"client_error: {e}",
+                            old="running", new="error",
+                            reason=f"non_retriable: {e}",
                         )
                         yield FinalResponseEvent(
                             text=f'LLM 网关拒绝请求（{type(e).__name__}: {str(e)[:240]}）。'
@@ -889,10 +946,9 @@ class Agent:
                         )
                         break
 
-                    # CONTINUE SITE 2: Prompt Too Long
-                    if "prompt too long" in error_str or "413" in error_str:
+                    # ── CONTEXT_TOO_LONG: compress and retry ──
+                    if kind == ErrorKind.CONTEXT_TOO_LONG:
                         if self._state.has_attempted_reactive_compact:
-                            # Already tried - do aggressive snip
                             self._state.messages = self._emergency_snip(self._state.messages)
                             self._state.has_attempted_reactive_compact = False
                         else:
@@ -907,61 +963,45 @@ class Agent:
 
                         self._state.consecutive_errors += 1
                         yield ErrorEvent(
-                            error_type="prompt_too_long",
+                            error_type="context_too_long",
                             turn=self._state.turn_number,
                             action="compact",
                         )
                         continue
 
-                    # CONTINUE SITE 3: Max Output Tokens
-                    if "max_tokens" in error_str or "length" in error_str:
-                        self._state.messages = [
-                            *self._state.messages,
-                            Message(role="user", content="Please continue from where you left off."),
-                        ]
-                        self._state.consecutive_errors += 1
-                        yield ErrorEvent(
-                            error_type="max_output_tokens",
-                            turn=self._state.turn_number,
-                            action="continue_prompt",
-                        )
-                        continue
-
-                    # CONTINUE SITE 4: Model Unavailable / Fallback
-                    if any(code in error_str for code in ["503", "429", "rate limit"]):
+                    # ── RATE_LIMITED: fallback model or backoff ──
+                    if kind == ErrorKind.RATE_LIMITED:
                         fallback_profile = self.settings.llm.get_fallback()
                         if fallback_profile:
-                            # Use the dedicated fallback profile (correct API
-                            # key + model name) instead of overriding the
-                            # provider on the primary profile.
                             self._llm_client = LLMClientFactory.create(fallback_profile)
                             yield ErrorEvent(
-                                error_type="model_unavailable",
+                                error_type="rate_limited",
                                 turn=self._state.turn_number,
                                 action="fallback",
                                 detail=f"Switched to fallback model: {fallback_profile.name}",
                             )
                         else:
-                            # No fallback configured — exponential backoff
-                            await asyncio.sleep(min(2 ** self._state.consecutive_errors, 60))
+                            await asyncio.sleep(
+                                min(2 ** self._state.consecutive_errors, 60)
+                            )
 
                         self._state.consecutive_errors += 1
-                        # Backoff even when fallback succeeded, to avoid
-                        # hammering the fallback endpoint on tight loops.
-                        await asyncio.sleep(min(2 ** (self._state.consecutive_errors - 1), 30))
+                        await asyncio.sleep(
+                            min(2 ** (self._state.consecutive_errors - 1), 30)
+                        )
                         continue
 
-                    # Generic retriable error
+                    # ── RETRIABLE: check max errors, backoff, retry ──
                     if self._state.check_max_errors():
                         self._state.status = AgentState.ERROR
                         self._state.last_error_type = type(e).__name__
                         yield StateChangeEvent(
-                            old="running",
-                            new="error",
+                            old="running", new="error",
                             reason=f"max_consecutive_errors: {e}",
                         )
                         yield FinalResponseEvent(
-                            text=f'连续错误次数过多，会话已终止（{type(e).__name__}: {e}）。您可以输入"继续"让我重试。'
+                            text=f'连续错误次数过多，会话已终止（{type(e).__name__}: {e}）。'
+                                 f'您可以输入"继续"让我重试。'
                         )
                         break
 
@@ -972,7 +1012,9 @@ class Agent:
                         action="retry",
                         detail=str(e),
                     )
-                    await asyncio.sleep(min(2 ** self._state.consecutive_errors, 30))
+                    await asyncio.sleep(
+                        min(2 ** self._state.consecutive_errors, 30)
+                    )
                     continue
         finally:
             if self._state.status == AgentState.RUNNING:

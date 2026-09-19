@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 HookCallback = Callable[..., Coroutine[Any, Any, Any]]
 
@@ -25,9 +29,10 @@ class HookSystem:
     Events: PreToolUse, PostToolUse, UserPromptSubmit, Stop, SessionStart
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hook_timeout: float = 10.0) -> None:
         self._hooks: dict[str, list[HookHandle]] = {}
         self._lock = asyncio.Lock()
+        self._hook_timeout = hook_timeout
 
     async def register(
         self,
@@ -63,7 +68,7 @@ class HookSystem:
         """Execute PreToolUse hooks in priority order.
 
         Each hook receives the current input and returns modified input.
-        Hook exceptions are isolated - one failing hook doesn't break others.
+        Hook exceptions or timeouts degrade to DENY (v4 rule).
         """
         event_type = "PreToolUse"
         current_input = dict(tool_input)
@@ -71,17 +76,29 @@ class HookSystem:
         hooks = self._hooks.get(event_type, [])
         for handle in hooks:
             try:
-                result = await handle.callback(
-                    tool_name=tool_name,
-                    tool_input=current_input,
-                    context=context or {},
+                result = await asyncio.wait_for(
+                    handle.callback(
+                        tool_name=tool_name,
+                        tool_input=current_input,
+                        context=context or {},
+                    ),
+                    timeout=self._hook_timeout,
                 )
                 if isinstance(result, dict):
                     current_input = result
             except Exception as e:
-                # Log but don't break the chain
-                print(f"Hook {handle.id} failed: {e}")
-                continue
+                # v4: Hook failure/timeout must DENY, not silently pass
+                if isinstance(e, asyncio.TimeoutError):
+                    reason = f"hook timed out after {self._hook_timeout}s"
+                else:
+                    reason = str(e)
+                logger.warning(
+                    "PreToolUse hook %s failed (denying): %s", handle.id, reason
+                )
+                return {
+                    "_hook_denied": True,
+                    "_hook_reason": reason,
+                }
 
         return current_input
 
@@ -99,16 +116,20 @@ class HookSystem:
         hooks = self._hooks.get(event_type, [])
         for handle in hooks:
             try:
-                result = await handle.callback(
-                    tool_name=tool_name,
-                    tool_input=tool_input,
-                    tool_output=current_output,
-                    context=context or {},
+                result = await asyncio.wait_for(
+                    handle.callback(
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_output=current_output,
+                        context=context or {},
+                    ),
+                    timeout=self._hook_timeout,
                 )
                 if result is not None:
                     current_output = result
             except Exception as e:
-                print(f"Hook {handle.id} failed: {e}")
+                # Post-hooks don't affect security decisions; log and continue
+                logger.warning("PostToolUse hook %s failed: %s", handle.id, e)
                 continue
 
         return current_output
@@ -125,14 +146,17 @@ class HookSystem:
         hooks = self._hooks.get(event_type, [])
         for handle in hooks:
             try:
-                result = await handle.callback(
-                    prompt_text=current_text,
-                    context=context or {},
+                result = await asyncio.wait_for(
+                    handle.callback(
+                        prompt_text=current_text,
+                        context=context or {},
+                    ),
+                    timeout=self._hook_timeout,
                 )
                 if isinstance(result, str):
                     current_text = result
             except Exception as e:
-                print(f"Hook {handle.id} failed: {e}")
+                logger.warning("UserPromptSubmit hook %s failed: %s", handle.id, e)
                 continue
 
         return current_text
@@ -148,12 +172,15 @@ class HookSystem:
         hooks = self._hooks.get(event_type, [])
         for handle in hooks:
             try:
-                await handle.callback(
-                    reason=reason,
-                    context=context or {},
+                await asyncio.wait_for(
+                    handle.callback(
+                        reason=reason,
+                        context=context or {},
+                    ),
+                    timeout=self._hook_timeout,
                 )
             except Exception as e:
-                print(f"Hook {handle.id} failed: {e}")
+                logger.warning("Stop hook %s failed: %s", handle.id, e)
                 continue
 
     def list_hooks(self, event_type: str | None = None) -> list[HookHandle]:

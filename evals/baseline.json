@@ -1,0 +1,12 @@
+{
+  "total_scenarios": 10,
+  "pass_rate": 0.0,
+  "avg_score": 0.0,
+  "categories": {
+    "general": {"pass_rate": 0.0, "count": 0},
+    "tool_selection": {"pass_rate": 0.0, "count": 0},
+    "error_recovery": {"pass_rate": 0.0, "count": 0},
+    "context_management": {"pass_rate": 0.0, "count": 0}
+  },
+  "last_updated": "2026-09-19"
+}
